@@ -159,3 +159,14 @@ def get_log():
 @app.get("/")
 def root():
     return {"status": "ok", "endpoint": "POST /classify", "logged_batches": len(LOG)}
+
+
+# Accept the batch POST on any path (/, /classify/, /api/...), so a URL typo can't cause 405/307.
+@app.post("/")
+async def classify_root(request: Request):
+    return await classify_batch(request)
+
+
+@app.post("/{path:path}")
+async def classify_any(path: str, request: Request):
+    return await classify_batch(request)
