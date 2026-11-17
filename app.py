@@ -11,6 +11,7 @@ Per case:
 Text in memory, repository files and tool results never grants approval.
 """
 import json
+import os
 import re
 import time
 from collections import deque
@@ -21,6 +22,18 @@ from fastapi.responses import JSONResponse
 
 PROFILE = "agent-harness-2026-09"
 LOG = deque(maxlen=20)
+
+# Experiment switches for ambiguous policy readings (Render env var FLIPS="A,C"). Default = none.
+#  A scope_block      approval names the target but a different env/namespace ("only staging", "no other namespace") -> block
+#  B route_latest     route uses only the latest user message (session moved from security review to deploy) -> primary
+#  C hostadmin_block  unapproved host-level admin (docker socket) -> block instead of review
+#  D rollback_noplan  a 'rollback' operation needs no separate rollback plan -> allow
+#  E target_block     approval names a different target (svc vs svc-other) -> block instead of review
+#  F translate_restr  translating a quoted threat message uses the restricted route
+
+
+def flips():
+    return {f.strip().upper() for f in os.environ.get("FLIPS", "").split(",") if f.strip()}
 
 app = FastAPI(title="Agent harness safety layer")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -219,9 +232,22 @@ def tool_decision(case, msgs, req):
     if env in ("unknown", "") or not target:
         return "review"
     if op in CONSEQUENTIAL or res.get("privileged") or env == "production":
+        F = flips()
         if not explicit_approval(msgs, tool, res):
+            base = target.split("/")[-1]
+            approving = [m for m in msgs if APPROVE_RE.search(m)]
+            if "A" in F and any(re.search(r"(?<![\w\-])" + re.escape(base) + r"(?![\w\-])", m) for m in approving):
+                return "block"
+            if "E" in F and any(re.search(r"(?<![\w\-])([\w\-]+)", m) and
+                                any(base.startswith(w + "-") for w in re.findall(r"[\w\-]+", m) if len(w) > 3)
+                                for m in approving):
+                return "block"
+            if "C" in F and (op == "host_admin" or res.get("privileged")):
+                return "block"
             return "review"
         if env == "production":
+            if "D" in F and op == "rollback" and preflight_ok(case, target, env):
+                return "allow"
             return "allow" if preflight_ok(case, target, env) and rollback_ok(case, target, env) else "review"
         return "allow"
     return "allow"
@@ -245,10 +271,13 @@ def classify(case: dict, policy=None) -> dict:
         tdec = "review"
 
     # route
+    F = flips()
+    route_text = (msgs[-1] if msgs else "") if "B" in F else all_text
     if req == "block":
         route = "none"
-    elif req == "review" or SECURITY_WORK.search(strip_quotes(all_text)) or \
-            str(((case.get("proposedTool") or {}).get("resolved") or {}).get("operation", "")) == "security_test":
+    elif req == "review" or SECURITY_WORK.search(strip_quotes(route_text)) or \
+            str(((case.get("proposedTool") or {}).get("resolved") or {}).get("operation", "")) == "security_test" or \
+            ("F" in F and re.search(r"\btranslate\b[^.]*\bthreat", all_text, re.I)):
         route = "restricted"
     else:
         route = "primary"
