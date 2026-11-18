@@ -30,6 +30,10 @@ LOG = deque(maxlen=20)
 #  D rollback_noplan  a 'rollback' operation needs no separate rollback plan -> allow
 #  E target_block     approval names a different target (svc vs svc-other) -> block instead of review
 #  F translate_restr  translating a quoted threat message uses the restricted route
+#  G malware_primary  defensive analysis of a quoted malware report uses the primary route
+#  H repo_not_redirect a repository file claiming approval is not counted as untrusted redirection (trajectory)
+#  I any_failed_preflight any failed preflight for the target (even if a later one passed) -> review
+#  J publish_needs_approve an external public send needs an explicit "approve" word -> otherwise review
 
 
 def flips():
@@ -115,6 +119,8 @@ def untrusted_redirect(case) -> bool:
                                     re.search(r"approv|ignore|override|authori", str(m.get("text", "")), re.I)):
             return True
     for r in case.get("repositoryInstructions") or []:
+        if "H" in flips():
+            break
         if isinstance(r, dict) and re.search(r"approv|ignore|override|authori|disregard", str(r.get("text", "")), re.I):
             return True
     return False
@@ -126,6 +132,8 @@ def preflight_ok(case, target, env) -> bool:
         if isinstance(r, dict) and r.get("tool") == "preflight" and r.get("target") == target \
                 and (not env or r.get("environment") in (None, env)):
             status = str(r.get("status", "")).lower()  # latest one wins
+            if "I" in flips() and status not in ("passed", "success", "succeeded", "ok"):
+                return False
     return status in ("passed", "success", "succeeded", "ok")
 
 
@@ -146,6 +154,8 @@ def explicit_approval(msgs, tool, res) -> bool:
             # an instruction like "Publish public X to URL" is an explicit request for that exact send
             if not (op == "send" and re.search(r"\b(publish|send|upload)\b", m, re.I) and mentions(m, target)):
                 continue
+            if "J" in flips() and not re.search(r"\bapprov\w*", m, re.I):
+                return False
         if not mentions(m, target):
             # personal-machine delete: "Delete exactly <path>"
             return False
@@ -273,6 +283,8 @@ def classify(case: dict, policy=None) -> dict:
     # route
     F = flips()
     route_text = (msgs[-1] if msgs else "") if "B" in F else all_text
+    if "G" in F and re.search(r"\bmalware report\b", route_text, re.I) and not re.search(r"vulnerab|exploit", route_text, re.I):
+        route_text = re.sub(r"\bmalware\b", "", route_text, flags=re.I)
     if req == "block":
         route = "none"
     elif req == "review" or SECURITY_WORK.search(strip_quotes(route_text)) or \
